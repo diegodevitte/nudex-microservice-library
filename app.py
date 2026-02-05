@@ -363,6 +363,345 @@ async def add_video_to_playlist(
     
     return {"message": "Video added to playlist"}
 
+@app.delete("/playlists/{playlist_id}/videos/{video_id}")
+async def remove_video_from_playlist(
+    playlist_id: str,
+    video_id: str,
+    user_id: str = Depends(get_user_id)
+):
+    """Remove video from playlist"""
+    # Check ownership
+    playlist = await db.playlists.find_one({
+        "id": playlist_id,
+        "user_id": user_id
+    })
+    
+    if not playlist:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+    
+    # Remove video
+    await db.playlists.update_one(
+        {"id": playlist_id, "user_id": user_id},
+        {
+            "$pull": {"videos": {"video_id": video_id}},
+            "$set": {"updated_at": datetime.utcnow()}
+        }
+    )
+    
+    return {"message": "Video removed from playlist"}
+
+# === ENHANCED PLAYLIST FEATURES ===
+
+@app.get("/playlists/search")
+async def search_playlists(
+    q: str,
+    user_id: str = Depends(get_user_id)
+):
+    """Search user's playlists by title or description"""
+    playlists = await db.playlists.find({
+        "user_id": user_id,
+        "$or": [
+            {"title": {"$regex": q, "$options": "i"}},
+            {"description": {"$regex": q, "$options": "i"}}
+        ]
+    }).sort("updated_at", -1).to_list(100)
+    
+    return {"playlists": playlists, "query": q}
+
+@app.post("/playlists/{playlist_id}/duplicate")
+async def duplicate_playlist(
+    playlist_id: str,
+    new_title: Optional[str] = None,
+    user_id: str = Depends(get_user_id)
+):
+    """Duplicate a playlist"""
+    # Get original playlist
+    original = await db.playlists.find_one({
+        "id": playlist_id,
+        "user_id": user_id
+    })
+    
+    if not original:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+    
+    # Create duplicate
+    new_playlist = {
+        "id": str(uuid.uuid4()),
+        "user_id": user_id,
+        "title": new_title or f"{original['title']} (Copy)",
+        "description": original.get("description", ""),
+        "is_public": False,  # Duplicates are private by default
+        "videos": original.get("videos", []).copy(),
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow()
+    }
+    
+    await db.playlists.insert_one(new_playlist)
+    
+    return {"playlist": new_playlist}
+
+@app.patch("/playlists/{playlist_id}/visibility")
+async def change_playlist_visibility(
+    playlist_id: str,
+    is_public: bool,
+    user_id: str = Depends(get_user_id)
+):
+    """Change playlist visibility (public/private)"""
+    result = await db.playlists.update_one(
+        {"id": playlist_id, "user_id": user_id},
+        {
+            "$set": {
+                "is_public": is_public,
+                "updated_at": datetime.utcnow()
+            }
+        }
+    )
+    
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+    
+    return {"message": f"Playlist visibility changed to {'public' if is_public else 'private'}"}
+
+@app.get("/playlists/public")
+async def get_public_playlists(
+    limit: int = 20,
+    skip: int = 0
+):
+    """Get public playlists from all users"""
+    playlists = await db.playlists.find({
+        "is_public": True
+    }).sort("updated_at", -1).skip(skip).limit(limit).to_list(limit)
+    
+    # Remove user_id from response for privacy
+    for playlist in playlists:
+        playlist.pop("user_id", None)
+    
+    return {"playlists": playlists}
+
+@app.post("/playlists/{playlist_id}/share")
+async def generate_share_link(
+    playlist_id: str,
+    user_id: str = Depends(get_user_id)
+):
+    """Generate a shareable link for a playlist"""
+    # Check ownership
+    playlist = await db.playlists.find_one({
+        "id": playlist_id,
+        "user_id": user_id
+    })
+    
+    if not playlist:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+    
+    # Generate share token
+    share_token = str(uuid.uuid4())
+    
+    # Update playlist with share info
+    await db.playlists.update_one(
+        {"id": playlist_id},
+        {
+            "$set": {
+                "share_token": share_token,
+                "shared_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow()
+            }
+        }
+    )
+    
+    share_link = f"/api/playlists/shared/{share_token}"
+    
+    return {"share_link": share_link, "share_token": share_token}
+
+@app.get("/playlists/shared/{share_token}")
+async def get_shared_playlist(share_token: str):
+    """Access a shared playlist via token"""
+    playlist = await db.playlists.find_one({"share_token": share_token})
+    
+    if not playlist:
+        raise HTTPException(status_code=404, detail="Shared playlist not found")
+    
+    # Remove sensitive info
+    playlist.pop("user_id", None)
+    playlist.pop("share_token", None)
+    
+    return {"playlist": playlist}
+
+# === ANALYTICS AND INSIGHTS ===
+
+@app.get("/analytics/overview")
+async def get_user_analytics(user_id: str = Depends(get_user_id)):
+    """Get user's library analytics overview"""
+    # Count favorites
+    favorites = await db.favorites.find_one({"user_id": user_id}) or {"video_ids": []}
+    total_favorites = len(favorites.get("video_ids", []))
+    
+    # Count playlists
+    total_playlists = await db.playlists.count_documents({"user_id": user_id})
+    
+    # Count videos in all playlists
+    playlists = await db.playlists.find({"user_id": user_id}).to_list(None)
+    total_playlist_videos = sum(len(p.get("videos", [])) for p in playlists)
+    
+    # History stats
+    history = await db.history.find_one({"user_id": user_id}) or {"items": []}
+    history_items = history.get("items", [])
+    total_watched = len(history_items)
+    
+    # Recent activity (last 7 days)
+    seven_days_ago = datetime.utcnow() - timedelta(days=7)
+    recent_history = [
+        item for item in history_items 
+        if item.get("watched_at", datetime.min) > seven_days_ago
+    ]
+    
+    return {
+        "overview": {
+            "total_favorites": total_favorites,
+            "total_playlists": total_playlists,
+            "total_playlist_videos": total_playlist_videos,
+            "total_watched": total_watched,
+            "recent_activity": len(recent_history)
+        },
+        "recent_playlists": await db.playlists.find(
+            {"user_id": user_id}
+        ).sort("updated_at", -1).limit(5).to_list(5),
+        "recent_history": recent_history[:10]
+    }
+
+@app.get("/analytics/watch-time")
+async def get_watch_time_analytics(
+    user_id: str = Depends(get_user_id),
+    days: int = 30
+):
+    """Get watch time analytics for the user"""
+    start_date = datetime.utcnow() - timedelta(days=days)
+    
+    history = await db.history.find_one({"user_id": user_id}) or {"items": []}
+    history_items = history.get("items", [])
+    
+    # Filter by date range
+    recent_items = [
+        item for item in history_items
+        if item.get("watched_at", datetime.min) > start_date
+    ]
+    
+    # Group by date
+    daily_stats = {}
+    for item in recent_items:
+        date_key = item["watched_at"].strftime("%Y-%m-%d")
+        if date_key not in daily_stats:
+            daily_stats[date_key] = {
+                "date": date_key,
+                "videos_watched": 0,
+                "total_progress": 0
+            }
+        daily_stats[date_key]["videos_watched"] += 1
+        daily_stats[date_key]["total_progress"] += item.get("progress", 0)
+    
+    # Sort by date
+    sorted_stats = sorted(daily_stats.values(), key=lambda x: x["date"])
+    
+    return {
+        "period": f"{days} days",
+        "total_videos": len(recent_items),
+        "total_time_seconds": sum(item.get("progress", 0) for item in recent_items),
+        "daily_stats": sorted_stats
+    }
+
+# === IMPORT/EXPORT FEATURES ===
+
+@app.get("/export/data")
+async def export_user_data(user_id: str = Depends(get_user_id)):
+    """Export all user library data"""
+    # Get all user data
+    favorites = await db.favorites.find_one({"user_id": user_id}) or {}
+    playlists = await db.playlists.find({"user_id": user_id}).to_list(None)
+    history = await db.history.find_one({"user_id": user_id}) or {}
+    
+    export_data = {
+        "export_date": datetime.utcnow().isoformat(),
+        "user_id": user_id,
+        "favorites": favorites.get("video_ids", []),
+        "playlists": playlists,
+        "history": history.get("items", [])
+    }
+    
+    return {"export_data": export_data}
+
+@app.post("/import/playlist")
+async def import_playlist(
+    playlist_data: dict,
+    user_id: str = Depends(get_user_id)
+):
+    """Import playlist data"""
+    try:
+        # Validate and clean playlist data
+        new_playlist = {
+            "id": str(uuid.uuid4()),
+            "user_id": user_id,
+            "title": playlist_data.get("title", "Imported Playlist"),
+            "description": playlist_data.get("description", ""),
+            "is_public": False,
+            "videos": playlist_data.get("videos", []),
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
+        }
+        
+        await db.playlists.insert_one(new_playlist)
+        
+        return {"message": "Playlist imported successfully", "playlist_id": new_playlist["id"]}
+        
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Import failed: {str(e)}")
+
+# === RECOMMENDATIONS ===
+
+@app.get("/recommendations/playlists")
+async def get_playlist_recommendations(
+    user_id: str = Depends(get_user_id),
+    limit: int = 10
+):
+    """Get playlist recommendations based on user's favorites"""
+    # Get user's favorites
+    favorites = await db.favorites.find_one({"user_id": user_id}) or {"video_ids": []}
+    favorite_videos = set(favorites.get("video_ids", []))
+    
+    if not favorite_videos:
+        # If no favorites, return popular public playlists
+        playlists = await db.playlists.find({
+            "is_public": True,
+            "user_id": {"$ne": user_id}
+        }).sort("updated_at", -1).limit(limit).to_list(limit)
+        
+        return {"recommendations": playlists, "reason": "popular_playlists"}
+    
+    # Find playlists that contain user's favorite videos
+    recommended_playlists = []
+    
+    async for playlist in db.playlists.find({
+        "is_public": True,
+        "user_id": {"$ne": user_id},
+        "videos.video_id": {"$in": list(favorite_videos)}
+    }).limit(limit * 2):
+        
+        # Calculate similarity score
+        playlist_videos = set(v.get("video_id") for v in playlist.get("videos", []))
+        similarity = len(favorite_videos.intersection(playlist_videos))
+        
+        playlist["similarity_score"] = similarity
+        recommended_playlists.append(playlist)
+    
+    # Sort by similarity and limit
+    recommended_playlists.sort(key=lambda x: x["similarity_score"], reverse=True)
+    recommended_playlists = recommended_playlists[:limit]
+    
+    # Remove sensitive data
+    for playlist in recommended_playlists:
+        playlist.pop("user_id", None)
+        playlist.pop("similarity_score", None)
+    
+    return {"recommendations": recommended_playlists, "reason": "similar_interests"}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
